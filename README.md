@@ -1,52 +1,68 @@
-# Shifter
+# Latent Tabular Lens — Shifter
 
-Задача: научить нейросеть‑**Shifter** модифицировать стандартный шум Z ~ N(0, I) в латентном пространстве предобученного CTGAN так, чтобы сгенерированные данные имели заданные мета‑характеристики m*.   
+> A neural network for **meta-feature-conditioned latent space steering** of a pretrained CTGAN — generating tabular data with user-specified statistical properties.
+
+> While the full study explores multiple OOD evaluation strategies, this codebase is dedicated specifically to the GAN-based latent steering approach.
 
 ---
 
-## Пайплайн состоит из двух этапов. 
+## How it works
 
-### 1) Обучение CTGAN
+Standard CTGAN samples noise `Z ~ N(0, I)` and passes it through a frozen generator. **Shifter** learns to apply a small, targeted shift to `Z` so that the generated data matches a desired set of meta-features `m*`.
 
-Обучаем CTGAN на исходных данных. После обучения веса CTGAN **замораживаются** и больше не меняются. 
+The CTGAN weights are **frozen throughout** — only Shifter is trained.
 
-### 2) Обучение Shifter 
-
-Shifter - это "контролируемая правка" шума перед генератором: мы подаём нормальный шум и m*, а сеть предсказывает небольшой сдвиг, который меняет свойства синтетики на выходе CTGAN.   
-У нас это residual‑модель:
-z̃_i = z_i + delta_scale · Δ_θ([z_i, c, μ_Z]),
-где c = MetaEncoder(m*), μ_Z = mean(Z).
-Глобальный вектор c одинаков для всех сэмплов батча, а μ_Z - permutation‑invariant summary батча (mean‑pooling в стиле DeepSets), чтобы сдвиг мог зависеть от "контекста набора" латентов. 
-
-### Что такое “шум” в этой постановке
-
-На каждом шаге обучения Shifter мы заново семплируем базовый шум:
-`Z_base = torch.randn(TRAIN_N_SAMPLES, z_dim)`.   
-То есть мы не "шумим данные", а каждый раз стартуем от нового Z и учим θ работать устойчиво по разным сэмплам шума. 
-
-Дополнительно CTGAN может использовать условный вектор `cond_vec`, который семплируется как `adapter.sample_cond_vec(TRAIN_N_SAMPLES)` и подаётся в генератор.   
-В дифференцируемой генерации `cond_vec` конвертируется в тензор с `requires_grad=False`, поэтому условия не оптимизируются градиентом. 
-
-### Функция потерь
-
-После генерации `X̃` берём числовые колонки и вычисляем значения мета‑фичей `m̂ = M(X̃)`, L_meta = MSE(m̂, m*).   
-
-Итог:
-`L_total = L_meta + λ_Z * L_z + λ_X * L_x`, где `L_z` - `latent_reg`, `L_x` - `feature_space_reg`. 
-
-### Backprop
-
-Один шаг обучения соответствует цепочке:  
-θ → Z̃ = s_θ(Z, m*) → X̃ = G(Z̃) → m̂ = M(X̃) → L(m̂, m*), затем `loss.backward()` и `opt.step()` обновляют только параметры Shifter. 
-
-### После обучения Shifter:  
-
-1) семплируем `Z = torch.randn(1, N_INFER, z_dim)` и считаем `Z̃ = shifter(Z, target_meta)`,   
-2) генерируем shifted‑датасет через `adapter.generate_from_noise(...)`. 
 ---
 
-### `src/` 
+## Architecture
 
-- `src/shifter.py`: `MetaEncoder` (кодирует `m*` → `c`) и `Shifter` (сдвиг `Z → Z̃` через mean‑pooling `μ_Z` + MLP), плюс `latent_reg` и `feature_space_reg`.   
-- `src/diff_mfs.py`: `compute_diff_mfs` - дифференцируемые мета‑фичи (mean/median/iq_range и `mut_inf` как Gaussian‑аппроксимация попарной взаимной информации на основе корреляции, то есть не MI(x,y), а MI(Xi,Xj), так как категориальный таргет исключается при вычислении мета-фич и градиенты через него не идут).   
-- `src/ctgan_adapter.py`: `CTGANRepoAdapter` - генерация из CTGAN по заданным латентам, включая `generate_from_noise_differentiable` для обучения (строит граф) и `generate_from_noise` для обычного инференса (под `no_grad`). 
+The shift is a residual correction:
+
+$$\tilde{z}_i = z_i + \delta_{\text{scale}} \cdot \Delta_\theta\bigl([z_i,\ c,\ \mu_Z]\bigr)$$
+
+- `c = MetaEncoder(m*)` — encodes target meta-features into a conditioning vector
+- `μ_Z = mean(Z)` — permutation-invariant batch summary 
+- `Δ_θ` — MLP predicting a per-sample shift
+- `δ_scale` — shift magnitude hyperparameter 
+
+---
+
+## Training
+
+**Step 1** — Train CTGAN on source data, then freeze all its weights.
+
+**Step 2** — Train Shifter end-to-end through the frozen generator:
+
+1. Sample fresh noise each step: `Z = torch.randn(N, z_dim)`
+2. Compute shifted noise: `Z̃ = shifter(Z, m*)`
+3. Generate data differentiably: `X̃ = adapter.generate_from_noise_differentiable(Z̃)`
+4. Compute differentiable meta-features: `m̂ = compute_diff_mfs(X̃)`
+5. Backprop only through Shifter
+
+**Loss:**
+
+$$\mathcal{L} = \underbrace{\text{MSE}(\hat{m},\ m^*)}_{\text{meta loss}} + \lambda_Z \cdot \underbrace{\|{\tilde{Z} - Z}\|^2}_{\text{latent reg}} + \lambda_X \cdot \underbrace{\|{\tilde{X} - X_\text{base}}\|^2}_{\text{feature reg}}$$
+
+
+---
+
+## Repository structure
+
+```
+latent-tabular-lens/
+├── shifter/
+│   ├── src/
+│   │   ├── shifter.py              # MetaEncoder, Shifter, regularization losses
+│   │   ├── differentiable_mfe.py   # Differentiable meta-features (mean, sd, cor, ...)
+│   │   └── ctgan_adapter.py        # CTGANRepoAdapter: standard + differentiable generation
+│   └── example/
+│       ├── shifter_electricity_demo.ipynb
+│       ├── shifter.pt
+│       ├── trained_ctgan_iris.pkl
+│       └── synthetic_shifted.csv
+├── preprocessing/
+│   └── tab_preprocessing.py
+├── external/
+│   └── ctgan_repo/                 # Custom CTGAN fork with noise-injection support
+└── simple_experiment.ipynb
+```
